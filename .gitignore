@@ -1,0 +1,32 @@
+# Rust build artifacts
+/target
+**/target/
+
+# Cargo lock（ライブラリではなくバイナリだが、外部開発者の再現性を優先するなら残す方針もあり）
+# 残すなら以下の行を削除
+Cargo.lock
+
+# Editor / OS
+*.rs.bk
+.DS_Store
+Thumbs.db
+
+# アプリのローカルデータ（実行時に生成。公開しない）
+tasks.json
+tasks.backup.json
+tasks.corrupt.json
+notes.json
+notes.backup.json
+notes.corrupt.json
+settings.json
+*.tmp
+images/
+
+# サイドカー成果物（別リポジトリの exe を sync/ に置く運用想定）
+sync/
+!sync/.gitkeep
+
+# 非公開ドキュメント（誤コミット防止）
+/private/
+*_非公開.md
+*_private.md
