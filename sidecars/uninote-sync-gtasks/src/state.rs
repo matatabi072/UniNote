@@ -1,10 +1,13 @@
-//! 同期状態（gtasks v1 PULL only 用、簡易版）。
+//! 同期状態（gtasks v2 双方向用）。
 //! sync/uninote-sync-gtasks.state.json に保存。
 //!
-//! 役割: ユーザーがローカルで削除したタスクが、次回 sync で remote から復活しないように
-//! tombstones（墓標）を保持する。
+//! 役割:
+//!   - tombstones: ローカル削除されたタスクが remote から復活しないよう抑止
+//!   - synced_tasks: 3-way merge 用の前回同期スナップショット
+//!     （ローカル変更 / リモート変更 / 両方変更 を判別する基準）
+use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 
@@ -22,10 +25,22 @@ pub struct SyncState {
     /// ローカル削除されたとみなす googleTaskId（再追加防止）
     #[serde(default)]
     pub tombstones: BTreeSet<String>,
+    /// 3-way merge 用スナップショット (google_task_id → 前回同期時の状態)
+    #[serde(default)]
+    pub synced_tasks: BTreeMap<String, TaskSnapshot>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TaskSnapshot {
+    pub title: String,
+    #[serde(default)]
+    pub is_completed: bool,
+    #[serde(default)]
+    pub scheduled_date_time: Option<NaiveDateTime>,
 }
 
 fn default_version() -> u32 {
-    1
+    2
 }
 
 fn state_path() -> PathBuf {

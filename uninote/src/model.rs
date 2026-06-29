@@ -66,6 +66,10 @@ pub struct Item {
     /// メモの種類（テキスト/画像）。未指定は Text。
     #[serde(default)]
     pub kind: ItemKind,
+    /// PCReminder に登録済みのとき、対応する登録キー（"uninote-<id 先頭8文字>"）。
+    /// 未登録時は省略してシリアライズ。
+    #[serde(default, rename = "reminderKey", skip_serializing_if = "Option::is_none")]
+    pub reminder_key: Option<String>,
     /// 画像メモのときの元ファイル名（表示用）
     #[serde(default, rename = "imageName")]
     pub image_name: Option<String>,
@@ -83,6 +87,7 @@ impl Item {
             manual_order: order,
             updated_at: Utc::now().to_rfc3339(),
             kind: ItemKind::Text,
+            reminder_key: None,
             image_name: None,
         }
     }
@@ -98,6 +103,7 @@ impl Item {
             manual_order: order,
             updated_at: Utc::now().to_rfc3339(),
             kind: ItemKind::Text,
+            reminder_key: None,
             image_name: None,
         }
     }
@@ -113,6 +119,7 @@ impl Item {
             manual_order: order,
             updated_at: Utc::now().to_rfc3339(),
             kind: ItemKind::Image,
+            reminder_key: None,
             image_name: Some(original_name),
         }
     }

@@ -43,6 +43,8 @@ UniNote/
 - 予定日時: クリックで日時編集ウィンドウ、表示形式は「日付 / 残り日数」「時刻 / 残り時間」を選択可
 - 期限切れ自動赤字表示
 - 完了タスクは末尾へ自動移動 + 淡色化
+- **タスクをクリックでミニビューワ起動**（別 OS ウィンドウ）— 本文閲覧・編集、URL を青リンクで表示してクリックで既定ブラウザ起動、「同じタスク作成」で複製を編集モードで開く
+- **ホバープレビュー** — タスクにポインターを乗せると、メインウィンドウの右側（収まらなければ左側）に本文プレビュー（別 OS ウィンドウ・クリックスルー）を表示
 
 ### メモモード
 - タイトル（先頭行）一覧 + ホバーで更新日時表示
@@ -57,6 +59,12 @@ UniNote/
 - フォントファミリー・サイズ即時反映
 - 全ウィンドウの位置・サイズを記憶（モニタ範囲外なら自動クランプ）
 - 設定ウィンドウはメインウィンドウ相対オフセットで配置記憶
+- スクロールバー常時表示（位置インジケータが常に視認可能）
+
+### 自動同期（v0.2.0〜）
+- **起動時に同期**（ON / OFF 切替可）+ **N 分間隔の定期同期**（既定 15 分、0 で無効）
+- サイドカー検出が必要。複数サイドカー（Todoist + Google Tasks 等）は順次実行（API レート対策・JSON 書込競合回避）
+- サイレント実行: 失敗時のみ上部バナーに警告。手動同期中・ビューワ編集中は一時停止して未保存編集の喪失を防止
 
 ## 🚀 入手・起動
 
@@ -92,7 +100,7 @@ cargo build --release -p uninote-sync-gtasks
 | サイドカー | サービス | 方向 | 認証 | 詳細 |
 |-----------|---------|------|------|------|
 | [uninote-sync-todoist](sidecars/uninote-sync-todoist/) | Todoist | 双方向 | API トークン | 3-way merge / 競合 remote-wins / 削除 push |
-| [uninote-sync-gtasks](sidecars/uninote-sync-gtasks/) | Google Tasks | PULL のみ（v1） | OAuth 2.0 | refresh 自動 / 削除追跡 tombstones |
+| [uninote-sync-gtasks](sidecars/uninote-sync-gtasks/) | Google Tasks | 双方向（v2） | OAuth 2.0 | 3-way merge / 競合 remote-wins / 削除 push / refresh 自動 / tombstones |
 
 ### セットアップ手順（共通）
 1. サイドカー exe を `sync/` フォルダに配置
@@ -102,6 +110,27 @@ cargo build --release -p uninote-sync-gtasks
 
 ### サイドカーを自作する
 任意の言語で実装可能です。プロトコル（JSON ファイル契約・配置ルール・終了コード等）は [docs/sidecar-contract.md](docs/sidecar-contract.md) を参照。
+
+## 🔌 関連ツール（プラグイン）
+
+外部 API 連携とは別に、**ローカル機能を拡張する独立 GUI/CLI ツール** を `tools/` フォルダに配置すると自動検出されます。本体の設定 →「関連ツール」セクションから起動可能。各ツールは UniNote なしでも単独動作するよう設計されています。
+
+| ツール | 機能 |
+|--------|------|
+| **SimpleCalendar** | tasks.json と連携するカレンダー表示（月/週/日）。`--linked-tasks` で UniNote の tasks.json を read-merge-write 共同管理 |
+| **PCReminder** | scheduledDateTime に応じて PC スリープ/復帰/通知を Windows タスクスケジューラに予約。CLI ベースで本体クラッシュ耐性あり |
+
+配置例:
+```
+UniNote/
+├ uninote.exe
+├ tasks.json
+├ tools/
+│  ├ simplecalendar.exe
+│  ├ pc-reminder.exe
+│  └ pc-reminder-gui.exe
+└ sync/  ← サイドカーは別フォルダ
+```
 
 ## 🗂 データ構造
 

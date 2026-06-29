@@ -113,6 +113,177 @@ pub fn data_dir_path() -> PathBuf {
     data_dir()
 }
 
+/// 関連ツールの情報（プラグイン）
+#[derive(Clone)]
+pub struct ToolInfo {
+    pub path: PathBuf,
+    pub key: String,           // "simplecalendar" など内部識別子
+    pub display_name: String,  // UI 表示用ラベル
+    pub icon: &'static str,    // 絵文字アイコン
+    /// SimpleCalendar の場合 `--linked-tasks <tasks.json>` を渡す等
+    pub link_tasks_arg: bool,
+}
+
+/// 関連ツール格納フォルダ（UniNote.exe と同階層の tools/）
+fn tools_dir() -> PathBuf {
+    let d = data_dir().join("tools");
+    let _ = fs::create_dir_all(&d);
+    d
+}
+
+/// 既知ツールテーブル: (filename_lower, display_name, icon, link_tasks_arg)
+fn known_tools() -> &'static [(&'static str, &'static str, &'static str, bool)] {
+    // pc-reminder.exe (CLI) は本体から起動する用途がないため、リストには含めない
+    // （存在する場合は GUI から内部的に呼び出される）。
+    &[
+        ("simplecalendar.exe", "SimpleCalendar — カレンダー表示", "📅", true),
+        ("pc-reminder-gui.exe", "PCReminder — リマインダー管理", "⏰", false),
+    ]
+}
+
+/// 自動検出する標準的な探索フォルダのリスト
+/// - Program Files / Program Files (x86)
+/// - Downloads / Desktop / Documents
+/// - C:\tools / C:\tool / C:\Tools / C:\Tool
+/// - UniNote.exe を置いているフォルダの親
+fn well_known_search_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    // Program Files (x64 / x86)
+    for env in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
+        if let Ok(p) = std::env::var(env) {
+            let p = PathBuf::from(p);
+            if p.is_dir() && !dirs.contains(&p) {
+                dirs.push(p);
+            }
+        }
+    }
+    // ユーザーフォルダ系
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        for sub in ["Downloads", "Desktop", "Documents"] {
+            let p = PathBuf::from(&home).join(sub);
+            if p.is_dir() {
+                dirs.push(p);
+            }
+        }
+    }
+    // C:\tools 系（ケース違いも一通り）
+    for name in ["tools", "tool", "Tools", "Tool"] {
+        let p = PathBuf::from(format!("C:\\{name}"));
+        if p.is_dir() && !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    }
+    // UniNote の親フォルダ（兄弟フォルダに置いてあるケース）
+    if let Some(parent) = data_dir().parent() {
+        let p = parent.to_path_buf();
+        if p.is_dir() && !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    }
+    dirs
+}
+
+/// 指定ディレクトリ以下（深さ max_depth まで）で、指定ファイル名 (小文字比較) を探す。
+/// 最初に見つかった絶対パスを返す。
+fn search_for_file(root: &Path, target_lower: &str, max_depth: usize) -> Option<PathBuf> {
+    let entries = fs::read_dir(root).ok()?;
+    let mut subdirs: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            if let Some(name) = path.file_name() {
+                if name.to_string_lossy().to_ascii_lowercase() == target_lower {
+                    return Some(path);
+                }
+            }
+        } else if path.is_dir() {
+            subdirs.push(path);
+        }
+    }
+    if max_depth > 0 {
+        for sub in subdirs {
+            if let Some(found) = search_for_file(&sub, target_lower, max_depth - 1) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// 関連ツール（プラグイン）を検出。
+/// 検出優先順:
+///   1. manual_paths で指定された絶対パス（存在チェック付き）
+///   2. UniNote.exe 同階層の tools/ 直下
+///   3. well_known_search_dirs() の各フォルダを深さ1まで再帰探索
+pub fn discover_tools(
+    manual_paths: &std::collections::BTreeMap<String, String>,
+) -> Vec<ToolInfo> {
+    let known = known_tools();
+    let local_tools = tools_dir();
+    let search_dirs = well_known_search_dirs();
+
+    let mut out: Vec<ToolInfo> = Vec::new();
+    for (fname, label, icon, link) in known {
+        let key = fname.trim_end_matches(".exe").to_string();
+        let mut found: Option<PathBuf> = None;
+
+        // 1. 手動登録パス
+        if let Some(p) = manual_paths.get(&key) {
+            let path = PathBuf::from(p);
+            if path.is_file() {
+                found = Some(path);
+            }
+        }
+        // 2. UniNote/tools/<filename>
+        if found.is_none() {
+            let p = local_tools.join(fname);
+            if p.is_file() {
+                found = Some(p);
+            }
+        }
+        // 3. 自動検出（標準的な配置場所を深さ1まで探索）
+        if found.is_none() {
+            for dir in &search_dirs {
+                if let Some(p) = search_for_file(dir, fname, 1) {
+                    found = Some(p);
+                    break;
+                }
+            }
+        }
+
+        if let Some(path) = found {
+            out.push(ToolInfo {
+                path,
+                key,
+                display_name: label.to_string(),
+                icon,
+                link_tasks_arg: *link,
+            });
+        }
+    }
+    out
+}
+
+/// 既知ツールテーブルを (key, display_name, expected_filename) のタプル列で返す。
+/// UI で「未検出のツール」をリスト表示する用途。
+pub fn known_tool_entries() -> Vec<(String, String, String)> {
+    known_tools()
+        .iter()
+        .map(|(fname, label, _icon, _link)| {
+            (
+                fname.trim_end_matches(".exe").to_string(),
+                label.to_string(),
+                fname.to_string(),
+            )
+        })
+        .collect()
+}
+
+/// UniNote の tasks.json の絶対パス
+pub fn tasks_path_abs() -> PathBuf {
+    tasks_path()
+}
+
 fn tasks_path() -> PathBuf {
     data_dir().join("tasks.json")
 }

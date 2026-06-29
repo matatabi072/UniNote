@@ -3,7 +3,7 @@
 use crate::creds_store::ClientCredentials;
 use crate::oauth;
 use crate::token_store::{self, Tokens};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const API_BASE: &str = "https://tasks.googleapis.com/tasks/v1";
@@ -35,6 +35,20 @@ struct TasksList {
     items: Vec<GTask>,
     #[serde(default)]
     next_page_token: Option<String>,
+}
+
+/// POST /tasks（create）/ PATCH /tasks/{id}（update）共通ボディ。
+/// PATCH では指定したフィールドだけ更新されるので、変更がない値は省略可能。
+#[derive(Serialize, Default, Clone, Debug, PartialEq, Eq)]
+pub struct TaskMutation {
+    pub title: String,
+    /// "needsAction" / "completed"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// 期限。RFC3339 UTC（時刻は無視され日付のみ保存される）。例: "2026-06-25T00:00:00.000Z"
+    /// null を送ると Google 側で「期限なし」を意味する（Option::None でフィールド省略）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub due: Option<String>,
 }
 
 pub struct Client {
@@ -85,6 +99,88 @@ impl Client {
             }
         } else {
             Ok(())
+        }
+    }
+
+    /// 新規タスク作成 / 既存タスク更新の共通リクエストボディ
+    /// Google Tasks の特性:
+    ///   - 優先度の概念なし
+    ///   - due は RFC3339 UTC（時刻部分は無視され日付のみ保存）
+    ///   - status: "needsAction" | "completed"
+    pub fn create_task(&mut self, body: &TaskMutation) -> Result<GTask, String> {
+        self.ensure_token()?;
+        let url = format!("{API_BASE}/lists/@default/tasks");
+        if std::env::var("UNINOTE_SYNC_DEBUG").is_ok() {
+            eprintln!(
+                "[debug] POST {url} body={}",
+                serde_json::to_string(body).unwrap_or_default()
+            );
+        }
+        let resp = self
+            .agent
+            .post(&url)
+            .set("Authorization", &format!("Bearer {}", self.tokens.access_token))
+            .send_json(body)
+            .map_err(classify_error)?;
+        let status = resp.status();
+        let text = resp.into_string().map_err(|e| format!("読込失敗: {e}"))?;
+        if std::env::var("UNINOTE_SYNC_DEBUG").is_ok() {
+            eprintln!("[debug] response {status}: {text}");
+        }
+        if !(200..300).contains(&status) {
+            return Err(format!("create_task 失敗: {status} body={text}"));
+        }
+        serde_json::from_str::<GTask>(&text).map_err(|e| format!("JSON 解析失敗: {e}"))
+    }
+
+    /// 既存タスク更新（PATCH。Google Tasks API は PATCH/PUT 両対応だが PATCH のほうが
+    /// 必要なフィールドだけ送れて安全）。
+    pub fn update_task(&mut self, id: &str, body: &TaskMutation) -> Result<(), String> {
+        self.ensure_token()?;
+        let url = format!("{API_BASE}/lists/@default/tasks/{id}");
+        if std::env::var("UNINOTE_SYNC_DEBUG").is_ok() {
+            eprintln!(
+                "[debug] PATCH {url} body={}",
+                serde_json::to_string(body).unwrap_or_default()
+            );
+        }
+        let resp = self
+            .agent
+            .request("PATCH", &url)
+            .set("Authorization", &format!("Bearer {}", self.tokens.access_token))
+            .send_json(body)
+            .map_err(classify_error)?;
+        let status = resp.status();
+        let text = resp.into_string().map_err(|e| format!("読込失敗: {e}"))?;
+        if std::env::var("UNINOTE_SYNC_DEBUG").is_ok() {
+            eprintln!("[debug] response {status}: {text}");
+        }
+        if !(200..300).contains(&status) {
+            return Err(format!("update_task 失敗: {status} body={text}"));
+        }
+        Ok(())
+    }
+
+    /// タスク削除。404 は冪等成功扱い。
+    pub fn delete_task(&mut self, id: &str) -> Result<(), String> {
+        self.ensure_token()?;
+        let url = format!("{API_BASE}/lists/@default/tasks/{id}");
+        let resp = self
+            .agent
+            .delete(&url)
+            .set("Authorization", &format!("Bearer {}", self.tokens.access_token))
+            .call();
+        match resp {
+            Ok(r) => {
+                let status = r.status();
+                if (200..300).contains(&status) {
+                    Ok(())
+                } else {
+                    Err(format!("delete_task 失敗: {status}"))
+                }
+            }
+            Err(ureq::Error::Status(404, _)) => Ok(()),
+            Err(e) => Err(classify_error(e)),
         }
     }
 

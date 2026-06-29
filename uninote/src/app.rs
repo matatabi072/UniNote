@@ -1,7 +1,7 @@
 use crate::model::{Item, Priority};
 use crate::settings::{
-    available_fonts, font_path_for, FarFormat, ImageDisplay, NearFormat, Settings, SortMode,
-    ThemeMode, ThumbShape,
+    available_fonts, font_path_for, AddTaskKey, FarFormat, ImageDisplay, NearFormat, PcAction,
+    Settings, SortMode, ThemeMode, ThumbShape,
 };
 use crate::storage;
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime};
@@ -74,19 +74,74 @@ impl DateBuf {
     }
 }
 
+/// 月日時分（2桁ゼロ埋め）フォーマッタ
+fn fmt2(n: f64, _: std::ops::RangeInclusive<usize>) -> String {
+    format!("{:02}", n as i32)
+}
+
+/// DragValue の表示幅を縮めるためのスタイル変更。
+/// 必ず ui.scope で子 UI を作って適用すること（親 UI の spacing_mut だけ
+/// 書き換えても、その後の ui.add に伝わらないケースがあるため）。
+fn apply_compact_style(ui: &mut egui::Ui) {
+    let s = ui.style_mut();
+    // DragValue が内部で使う Button の左右 padding を最小化
+    s.spacing.button_padding.x = 1.0;
+    // 要素間の隙間も詰める
+    s.spacing.item_spacing.x = 1.0;
+    // widget の最小幅も縮める（DragValue/Button が下限に張り付くのを防ぐ）
+    s.spacing.interact_size.x = 0.0;
+}
+
+/// 日付部（年/月/日）を描画。DragValue を自然サイズで配置することで
+/// Button/Checkbox と同じ widget 高さになり、ベースラインが揃う。
+/// 月/日 は custom_formatter で 2 桁固定 → 幅も安定。
+fn date_part(ui: &mut egui::Ui, b: &mut DateBuf) {
+    ui.scope(|ui| {
+        apply_compact_style(ui);
+        ui.add(egui::DragValue::new(&mut b.y).speed(1).range(1970..=9999));
+        ui.label("/");
+        ui.add(
+            egui::DragValue::new(&mut b.mo)
+                .speed(1)
+                .range(1..=12)
+                .custom_formatter(fmt2),
+        );
+        ui.label("/");
+        ui.add(
+            egui::DragValue::new(&mut b.d)
+                .speed(1)
+                .range(1..=31)
+                .custom_formatter(fmt2),
+        );
+    });
+}
+
+/// 時刻部（時:分）を描画。同じく add で自然サイズ + 2 桁固定。
+/// 時:分 は同じ ui.horizontal の中で連続描画 → 途中で折り返されない。
+fn time_part(ui: &mut egui::Ui, b: &mut DateBuf) {
+    ui.scope(|ui| {
+        apply_compact_style(ui);
+        ui.add(
+            egui::DragValue::new(&mut b.h)
+                .speed(1)
+                .range(0..=23)
+                .custom_formatter(fmt2),
+        );
+        ui.label(":");
+        ui.add(
+            egui::DragValue::new(&mut b.mi)
+                .speed(1)
+                .range(0..=59)
+                .custom_formatter(fmt2),
+        );
+    });
+}
+
+/// 年月日時分をまとめて描画（横幅に余裕がある場面用。ポップアップ等）。
 fn date_fields(ui: &mut egui::Ui, b: &mut DateBuf) {
-    let h = ui.spacing().interact_size.y;
-    let wy = 44.0;
-    let wn = 22.0;
-    ui.spacing_mut().item_spacing.x = 2.0;
-    ui.add_sized([wy, h], egui::DragValue::new(&mut b.y).speed(1));
-    ui.label("/");
-    ui.add_sized([wn, h], egui::DragValue::new(&mut b.mo).speed(1));
-    ui.label("/");
-    ui.add_sized([wn, h], egui::DragValue::new(&mut b.d).speed(1));
-    ui.add_sized([wn, h], egui::DragValue::new(&mut b.h).speed(1));
-    ui.label(":");
-    ui.add_sized([wn, h], egui::DragValue::new(&mut b.mi).speed(1));
+    date_part(ui, b);
+    ui.add_space(4.0);
+    time_part(ui, b);
     b.clamp();
 }
 
@@ -99,6 +154,8 @@ pub struct App {
     new_task_text: String,
     new_task_use_date: bool,
     new_task_buf: DateBuf,
+    /// 新規タスク作成時の PC 操作種別（PCReminder への予約内容）
+    new_task_pc_action: PcAction,
     editing_task_date: Option<String>,
     edit_buf: DateBuf,
     // メモモード固有
@@ -129,6 +186,35 @@ pub struct App {
     sidecars: Vec<storage::SidecarInfo>,
     active_sync: Option<ActiveSync>,
     show_sync_log: bool,
+    // 自動同期スケジューラ
+    /// 直近の自動同期スタート時刻（次回起動判定の基準）。
+    /// App::new() で now を入れて、起動直後に間隔ぶん待ってから初回 tick が来るようにする。
+    last_auto_sync_at: Instant,
+    /// 自動同期の待機キュー（複数サイドカーを順次起動するため）
+    auto_sync_queue: std::collections::VecDeque<storage::SidecarInfo>,
+    /// 起動時同期を実行済みか
+    startup_sync_done: bool,
+    /// 現在の active_sync が自動同期由来か（自動なら終了時に静かに閉じる）
+    current_sync_is_auto: bool,
+    // 関連ツール（プラグイン）
+    tools: Vec<storage::ToolInfo>,
+    tool_status: Option<String>,
+    /// PCReminder 登録/解除の通知メッセージ（バナー表示）
+    reminder_status: Option<String>,
+    reminder_status_is_error: bool,
+    /// タスク右クリックメニュー（独立ウィンドウ）の対象タスク id
+    context_menu_task_id: Option<String>,
+    /// メニュー表示位置（スクリーン絶対座標 = 行の左下）
+    context_menu_screen_pos: Option<[f32; 2]>,
+    /// タスク内容ビューワ（ミニウィンドウ）の対象タスク id。None = 非表示。
+    viewing_task_id: Option<String>,
+    /// ビューワの編集モード（true = TextEdit、false = リンク化表示）
+    viewing_task_edit_mode: bool,
+    /// 編集モードでの編集バッファ（保存時に該当タスクに書き戻す）
+    viewing_task_edit_buf: String,
+    /// ホバー時に外部プレビューウィンドウへ表示するタスク本文。
+    /// 各フレーム冒頭で None にリセットされ、ホバー検出時にそのタスクの本文がセットされる。
+    pending_preview: Option<String>,
     // セットアップウィザード
     show_setup_wizard: bool,
     wizard_tab: WizardTab,
@@ -159,6 +245,9 @@ impl App {
         let current_font = settings.font_family.clone();
         let current_theme = settings.theme;
         let current_on_top = settings.always_on_top;
+        let pc_action_initial = settings.pc_action_default;
+        // tools 初期検出（settings.manual_tool_paths を使う。move 前にスキャンしておく）
+        let tools_initial = storage::discover_tools(&settings.manual_tool_paths);
         let status_msg = tasks_msg.or(notes_msg);
         Self {
             mode: Mode::Task,
@@ -168,6 +257,8 @@ impl App {
             new_task_text: String::new(),
             new_task_use_date: false,
             new_task_buf: DateBuf::now(),
+            // settings は move 後なので、あらかじめ取り出した初期値を使う
+            new_task_pc_action: pc_action_initial,
             editing_task_date: None,
             edit_buf: DateBuf::now(),
             selected_note: 0,
@@ -194,6 +285,20 @@ impl App {
             sidecars: storage::discover_sidecars(),
             active_sync: None,
             show_sync_log: false,
+            last_auto_sync_at: Instant::now(),
+            auto_sync_queue: std::collections::VecDeque::new(),
+            startup_sync_done: false,
+            current_sync_is_auto: false,
+            tools: tools_initial,
+            tool_status: None,
+            reminder_status: None,
+            reminder_status_is_error: false,
+            context_menu_task_id: None,
+            context_menu_screen_pos: None,
+            viewing_task_id: None,
+            viewing_task_edit_mode: false,
+            viewing_task_edit_buf: String::new(),
+            pending_preview: None,
             show_setup_wizard: false,
             wizard_tab: WizardTab::Todoist,
             wizard_todoist_token: String::new(),
@@ -275,6 +380,288 @@ impl App {
         }
     }
 
+    /// PCReminder CLI exe のパス（tools/pc-reminder.exe）。なければ None。
+    fn pcr_cli_path() -> Option<PathBuf> {
+        let p = storage::data_dir_path().join("tools").join("pc-reminder.exe");
+        if p.is_file() { Some(p) } else { None }
+    }
+
+    /// 起動時にスキャン済みの self.tools に指定 key のツールが含まれているか。
+    /// 既知ツールテーブル（discover_tools）の key と一致する。
+    /// 例: "pc-reminder-gui" / "simplecalendar"
+    fn is_tool_available(&self, key: &str) -> bool {
+        self.tools.iter().any(|t| t.key == key)
+    }
+
+    /// 指定タスクの予定日時を PCReminder に登録する。
+    /// 検証: scheduledDateTime 必須、現在時刻より未来であること。失敗時はバナーで通知。
+    fn register_reminder(&mut self, idx: usize) {
+        self.reminder_status = None;
+        let cli = match Self::pcr_cli_path() {
+            Some(p) => p,
+            None => {
+                self.reminder_status = Some(
+                    "⚠ PCReminder が tools/ に見つかりません。pc-reminder.exe を配置してください。".into(),
+                );
+                self.reminder_status_is_error = true;
+                return;
+            }
+        };
+        let task = match self.tasks.get(idx) {
+            Some(t) => t.clone(),
+            None => return,
+        };
+        let dt = match task.scheduled_date_time {
+            Some(d) => d,
+            None => {
+                self.reminder_status = Some(
+                    "⚠ 予定日時が設定されていません。先に予定日時を編集してから登録してください。"
+                        .into(),
+                );
+                self.reminder_status_is_error = true;
+                return;
+            }
+        };
+        let now = chrono::Local::now().naive_local();
+        if dt <= now {
+            self.reminder_status = Some(format!(
+                "⚠ 予定日時 ({}) が現在時刻より過去です。リマインダーは登録できません。",
+                dt.format("%Y/%m/%d %H:%M")
+            ));
+            self.reminder_status_is_error = true;
+            return;
+        }
+
+        let key = format!(
+            "uninote-{}",
+            &task.id[..task.id.len().min(8)]
+        );
+        let time_str = dt.format("%Y/%m/%d %H:%M").to_string();
+        let content = if task.task_content.trim().is_empty() {
+            "(無題のタスク)".to_string()
+        } else {
+            task.task_content.clone()
+        };
+
+        let mut cmd = Command::new(&cli);
+        cmd.current_dir(storage::data_dir_path());
+        cmd.arg("/add_remind")
+            .arg("--key")
+            .arg(&key)
+            .arg(&time_str)
+            .arg(&content);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        match cmd.output() {
+            Ok(out) => {
+                if out.status.success() {
+                    self.tasks[idx].reminder_key = Some(key);
+                    self.tasks[idx].touch();
+                    self.dirty_tasks = true;
+                    self.reminder_status = Some(format!(
+                        "🔔 リマインダー登録: {} に通知します",
+                        time_str
+                    ));
+                    self.reminder_status_is_error = false;
+                } else {
+                    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+                    self.reminder_status = Some(format!(
+                        "❌ 登録失敗 (exit {}): {}",
+                        out.status.code().unwrap_or(-1),
+                        stderr.trim()
+                    ));
+                    self.reminder_status_is_error = true;
+                }
+            }
+            Err(e) => {
+                self.reminder_status = Some(format!("❌ pc-reminder 起動失敗: {e}"));
+                self.reminder_status_is_error = true;
+            }
+        }
+    }
+
+    /// 指定タスクに任意の PC 操作を予約する（通知/起動/スリープ）。
+    /// PcAction の値に応じて pc-reminder に渡すコマンドを切り替える。
+    fn register_pc_action(&mut self, idx: usize, action: PcAction) {
+        self.reminder_status = None;
+        if action == PcAction::None {
+            return;
+        }
+        let cli = match Self::pcr_cli_path() {
+            Some(p) => p,
+            None => {
+                self.reminder_status = Some(
+                    "⚠ PCReminder が tools/ に見つかりません。pc-reminder.exe を配置してください。".into(),
+                );
+                self.reminder_status_is_error = true;
+                return;
+            }
+        };
+        let task = match self.tasks.get(idx) {
+            Some(t) => t.clone(),
+            None => return,
+        };
+        let dt = match task.scheduled_date_time {
+            Some(d) => d,
+            None => {
+                self.reminder_status = Some(
+                    "⚠ 予定日時が設定されていません。先に予定日時を編集してください。".into(),
+                );
+                self.reminder_status_is_error = true;
+                return;
+            }
+        };
+        let now = chrono::Local::now().naive_local();
+        if dt <= now {
+            self.reminder_status = Some(format!(
+                "⚠ 予定日時 ({}) が現在時刻より過去です。予約できません。",
+                dt.format("%Y/%m/%d %H:%M")
+            ));
+            self.reminder_status_is_error = true;
+            return;
+        }
+
+        let key = format!("uninote-{}", &task.id[..task.id.len().min(8)]);
+        let time_str = dt.format("%Y/%m/%d %H:%M").to_string();
+        let content = if task.task_content.trim().is_empty() {
+            "(無題のタスク)".to_string()
+        } else {
+            task.task_content.clone()
+        };
+
+        // PcAction → pc-reminder CLI コマンド
+        let (subcmd, with_wake, needs_message, label) = match action {
+            PcAction::Notify => ("/add_remind", false, true, "通知"),
+            PcAction::Wake => ("/add_remind", true, true, "起動＋通知"),
+            PcAction::Sleep => ("/add_sleep", false, false, "スリープ"),
+            PcAction::None => return,
+        };
+
+        let mut cmd = Command::new(&cli);
+        cmd.current_dir(storage::data_dir_path());
+        cmd.arg(subcmd).arg("--key").arg(&key);
+        if with_wake {
+            cmd.arg("--wake");
+        }
+        cmd.arg(&time_str);
+        if needs_message {
+            cmd.arg(&content);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        match cmd.output() {
+            Ok(out) => {
+                if out.status.success() {
+                    self.tasks[idx].reminder_key = Some(key);
+                    self.tasks[idx].touch();
+                    self.dirty_tasks = true;
+                    self.reminder_status = Some(format!(
+                        "✅ {} を予約: {} に発火します",
+                        label, time_str
+                    ));
+                    self.reminder_status_is_error = false;
+                } else {
+                    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+                    self.reminder_status = Some(format!(
+                        "❌ {} 予約失敗 (exit {}): {}",
+                        label,
+                        out.status.code().unwrap_or(-1),
+                        stderr.trim()
+                    ));
+                    self.reminder_status_is_error = true;
+                }
+            }
+            Err(e) => {
+                self.reminder_status = Some(format!("❌ pc-reminder 起動失敗: {e}"));
+                self.reminder_status_is_error = true;
+            }
+        }
+    }
+
+    /// 指定タスクのリマインダーを解除する。
+    fn unregister_reminder(&mut self, idx: usize) {
+        self.reminder_status = None;
+        let task = match self.tasks.get(idx) {
+            Some(t) => t.clone(),
+            None => return,
+        };
+        let key = match &task.reminder_key {
+            Some(k) => k.clone(),
+            None => return,
+        };
+        // ローカルからはまず除去（CLI 失敗でも消す: スケジューラ側に残骸があっても /remove で再試行可能）
+        self.tasks[idx].reminder_key = None;
+        self.tasks[idx].touch();
+        self.dirty_tasks = true;
+
+        let cli = match Self::pcr_cli_path() {
+            Some(p) => p,
+            None => {
+                self.reminder_status = Some(
+                    "🔕 ローカルでは解除しました（pc-reminder 未配置のため Windows タスクスケジューラからの削除は手動でお願いします）".into(),
+                );
+                self.reminder_status_is_error = true;
+                return;
+            }
+        };
+        let mut cmd = Command::new(&cli);
+        cmd.current_dir(storage::data_dir_path());
+        cmd.arg("/remove").arg(&key);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+        match cmd.output() {
+            Ok(out) => {
+                if out.status.success() {
+                    self.reminder_status = Some("🔕 リマインダーを解除しました".into());
+                    self.reminder_status_is_error = false;
+                } else {
+                    self.reminder_status = Some(format!(
+                        "🔕 解除済 (タスクスケジューラ側 exit {} のため再確認推奨)",
+                        out.status.code().unwrap_or(-1)
+                    ));
+                    self.reminder_status_is_error = false;
+                }
+            }
+            Err(e) => {
+                self.reminder_status = Some(format!("🔕 解除済（pc-reminder 起動失敗: {e}）"));
+                self.reminder_status_is_error = true;
+            }
+        }
+    }
+
+    /// 関連ツール（プラグイン）を独立プロセスとして起動。
+    /// 連携対応ツールには UniNote の tasks.json パスを引数で渡す。
+    fn launch_tool(&mut self, tool: &storage::ToolInfo) {
+        let mut cmd = Command::new(&tool.path);
+        cmd.current_dir(storage::data_dir_path());
+        if tool.link_tasks_arg {
+            cmd.arg("--linked-tasks").arg(storage::tasks_path_abs());
+        }
+        // GUI ツールはコンソール非表示
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        match cmd.spawn() {
+            Ok(_child) => {
+                self.tool_status = Some(format!("✅ {} を起動しました", tool.display_name));
+            }
+            Err(e) => {
+                self.tool_status = Some(format!("❌ {} 起動失敗: {e}", tool.display_name));
+            }
+        }
+    }
+
     /// メインウィンドウが常に最前面の場合、サブウィンドウも同じレベルにする。
     /// そうしないと AlwaysOnTop のメインに隠れて操作できなくなる。
     fn sub_window_level(&self) -> egui::WindowLevel {
@@ -282,6 +669,484 @@ impl App {
             egui::WindowLevel::AlwaysOnTop
         } else {
             egui::WindowLevel::Normal
+        }
+    }
+
+    /// タスク右クリックメニューを独立 OS ウィンドウとして描画する。
+    /// 右クリックされた行の直下（スクリーン絶対座標）に表示。
+    /// メニュー項目選択 / Esc / × / フォーカス喪失 で閉じる。
+    fn draw_context_menu(&mut self, ctx: &egui::Context) {
+        let Some(task_id) = self.context_menu_task_id.clone() else {
+            return;
+        };
+        let pos = self.context_menu_screen_pos.unwrap_or([0.0, 0.0]);
+        // メニュー高さ: タイトルバー + ラベル + 重要度ボタン4個 + セパレータ +
+        //   予定日時編集 + リマインダー登録/解除 + 削除 を見切れずに収める
+        let size = [220.0, 320.0];
+
+        let has_reminder = self
+            .tasks
+            .iter()
+            .find(|t| t.id == task_id)
+            .map(|t| t.reminder_key.is_some())
+            .unwrap_or(false);
+        let pcr_available = self.is_tool_available("pc-reminder-gui");
+
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title("メニュー — UniNote")
+            .with_inner_size(size)
+            .with_min_inner_size([180.0, 200.0])
+            // 念のためリサイズ可能にして、項目が増えても拡張できるように
+            .with_resizable(true)
+            .with_position(pos)
+            .with_window_level(self.sub_window_level());
+        // モニタ範囲外にはみ出ないようクランプ
+        if let Some(mon) = self.monitor_size {
+            let clamped = clamp_pos(pos, size, mon);
+            builder = builder.with_position(clamped);
+        }
+
+        let mut close = false;
+        let mut chosen: Option<RowAction> = None;
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("task_context_menu"),
+            builder,
+            |ctx2, _class| {
+                egui::CentralPanel::default().show(ctx2, |ui| {
+                    // 縦スクロール可能。ウィンドウが小さくなっても全項目に到達できる。
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if let Some(a) = row_menu(ui, has_reminder, pcr_available) {
+                                chosen = Some(a);
+                            }
+                        });
+                });
+                // 閉じる条件: × / Esc / フォーカス喪失
+                if ctx2.input(|i| i.viewport().close_requested()) {
+                    close = true;
+                }
+                if ctx2.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    close = true;
+                }
+                if !ctx2.input(|i| i.viewport().focused.unwrap_or(true)) {
+                    close = true;
+                }
+            },
+        );
+
+        // 選択されたアクションを実行
+        if let Some(action) = chosen {
+            if let Some(i) = self.tasks.iter().position(|t| t.id == task_id) {
+                match action {
+                    RowAction::SetPriority(p) => {
+                        if let Some(t) = self.tasks.get_mut(i) {
+                            t.priority = p;
+                            t.touch();
+                            self.dirty_tasks = true;
+                        }
+                    }
+                    RowAction::EditDate => {
+                        if let Some(t) = self.tasks.get(i) {
+                            self.edit_buf = t
+                                .scheduled_date_time
+                                .map(DateBuf::from_dt)
+                                .unwrap_or_else(DateBuf::now);
+                            self.editing_task_date = Some(t.id.clone());
+                        }
+                    }
+                    RowAction::Delete => {
+                        if i < self.tasks.len() {
+                            if self.tasks[i].reminder_key.is_some() {
+                                self.unregister_reminder(i);
+                            }
+                            self.tasks.remove(i);
+                            self.renumber_tasks();
+                            self.dirty_tasks = true;
+                        }
+                    }
+                    RowAction::SetReminder => {
+                        self.register_reminder(i);
+                    }
+                    RowAction::ClearReminder => {
+                        self.unregister_reminder(i);
+                    }
+                }
+            }
+            close = true;
+        }
+
+        if close {
+            self.context_menu_task_id = None;
+            self.context_menu_screen_pos = None;
+        }
+    }
+
+    /// ホバー時にメインウィンドウの右側（収まらなければ左側）に出す
+    /// タスク本文プレビュー。装飾なし・クリックスルー・常に最前面。
+    /// メインウィンドウより広めの幅を取り、URL は色付け表示する（クリックは下に通る）。
+    fn draw_hover_preview(&self, ctx: &egui::Context) {
+        let Some(content) = self.pending_preview.clone() else {
+            return;
+        };
+        // ビューワ/コンテキストメニュー表示中は出さない
+        if self.viewing_task_id.is_some() || self.context_menu_task_id.is_some() {
+            return;
+        }
+        let (Some(wp), Some(ws), Some(mon)) =
+            (self.win_pos, self.win_size, self.monitor_size)
+        else {
+            return;
+        };
+
+        // 本文表示用に少し大きめ。固定サイズ + スクロール対応で内容が長くても可視。
+        let pv_size = [360.0_f32, 240.0_f32];
+
+        // X: 右側優先、収まらなければ左側、それでもダメなら片側にクランプ
+        let right_x = wp[0] + ws[0] + 6.0;
+        let left_x = wp[0] - pv_size[0] - 6.0;
+        let x = if right_x + pv_size[0] <= mon[0] {
+            right_x
+        } else if left_x >= 0.0 {
+            left_x
+        } else {
+            (mon[0] - pv_size[0]).max(0.0)
+        };
+
+        // Y: カーソルY位置（メインウィンドウのコンテンツ座標系）を中央に揃える。
+        // 取得できなかった場合は窓上端から 40px の位置をフォールバックに（wp[1] は加算しない）。
+        let cursor_y = ctx
+            .input(|i| i.pointer.latest_pos())
+            .map(|p| p.y)
+            .unwrap_or(40.0);
+        let y_screen = wp[1] + cursor_y - pv_size[1] / 2.0;
+        let y = y_screen
+            .clamp(wp[1], wp[1] + ws[1] - pv_size[1])
+            .max(0.0)
+            .min(mon[1] - pv_size[1]);
+
+        let builder = egui::ViewportBuilder::default()
+            .with_title("preview")
+            .with_inner_size(pv_size)
+            .with_min_inner_size(pv_size)
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_taskbar(false)
+            .with_window_level(egui::WindowLevel::AlwaysOnTop)
+            .with_position([x, y])
+            // クリックスルー: マウス操作は常に下（メインウィンドウ）へ通す
+            .with_mouse_passthrough(true);
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("hover_preview"),
+            builder,
+            |ctx2, _class| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::popup(&ctx2.style()))
+                    .show(ctx2, |ui| {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if content.trim().is_empty() {
+                                    ui.weak("(本文なし)");
+                                    return;
+                                }
+                                // ビューワと同じ要領で URL を色付け表示
+                                // （クリックスルーなのでクリックは下に通る）
+                                let segments = split_url_segments(&content);
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 0.0;
+                                    for seg in segments {
+                                        match seg {
+                                            TextSegment::Text(t) => {
+                                                let mut first = true;
+                                                for line in t.split('\n') {
+                                                    if !first {
+                                                        ui.end_row();
+                                                    }
+                                                    if !line.is_empty() {
+                                                        ui.label(line);
+                                                    }
+                                                    first = false;
+                                                }
+                                            }
+                                            TextSegment::Url(u) => {
+                                                ui.label(
+                                                    RichText::new(&u)
+                                                        .color(Color32::from_rgb(
+                                                            100, 170, 240,
+                                                        ))
+                                                        .underline(),
+                                                );
+                                            }
+                                        }
+                                    }
+                                });
+                            });
+                    });
+            },
+        );
+    }
+
+    /// タスク内容ビューワ（別 OS ウィンドウ）。
+    /// 表示モード = URL リンク化済みテキスト + メタ情報。
+    /// 編集モード = TextEdit::multiline で task_content を直接編集。
+    /// ESC: 編集中ならキャンセル、表示中ならウィンドウを閉じる。
+    fn draw_task_viewer(&mut self, ctx: &egui::Context) {
+        let Some(task_id) = self.viewing_task_id.clone() else {
+            return;
+        };
+        // 対象タスクのスナップショット（表示中に他で削除された場合は閉じる）
+        let task = match self.tasks.iter().find(|t| t.id == task_id) {
+            Some(t) => t.clone(),
+            None => {
+                self.viewing_task_id = None;
+                self.viewing_task_edit_mode = false;
+                self.viewing_task_edit_buf.clear();
+                return;
+            }
+        };
+
+        let size = self.settings.task_view_size.unwrap_or([480.0, 320.0]);
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title("📝 タスク内容 — UniNote")
+            .with_inner_size(size)
+            .with_min_inner_size([280.0, 200.0])
+            .with_resizable(true)
+            .with_window_level(self.sub_window_level());
+
+        // 初期位置: メインウィンドウ左上 + 保存オフセット（初回はメインの中央）
+        let initial_pos: Option<[f32; 2]> = match (self.win_pos, self.monitor_size) {
+            (Some(mp), Some(mon)) => {
+                let offset = self.settings.task_view_offset.unwrap_or_else(|| {
+                    let ms = self.win_size.unwrap_or([0.0, 0.0]);
+                    [(ms[0] - size[0]) / 2.0, (ms[1] - size[1]) / 2.0]
+                });
+                let candidate = [mp[0] + offset[0], mp[1] + offset[1]];
+                Some(clamp_pos(candidate, size, mon))
+            }
+            _ => None,
+        };
+        if let Some(p) = initial_pos {
+            builder = builder.with_position(p);
+        }
+
+        let mut close = false;
+        let mut save_content: Option<String> = None;
+        // 「同じタスク作成」要求。Some(()) = 複製要求あり。
+        // 処理は viewport 抜けた後に行う（self.tasks への push と viewing_task_id 差し替え）。
+        let mut duplicate_request = false;
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("task_viewer"),
+            builder,
+            |ctx2, _class| {
+                // 位置・サイズの記憶（メインウィンドウ左上を基準にオフセット保存）
+                ctx2.input(|i| {
+                    let vp = i.viewport();
+                    if let Some(inner) = vp.inner_rect {
+                        self.settings.task_view_size =
+                            Some([inner.width(), inner.height()]);
+                    }
+                    if let Some(outer) = vp.outer_rect {
+                        if let Some(mp) = self.win_pos {
+                            self.settings.task_view_offset =
+                                Some([outer.min.x - mp[0], outer.min.y - mp[1]]);
+                        }
+                    }
+                });
+
+                // ─── 上段: メタ情報 ───
+                egui::TopBottomPanel::top("tv_meta").show(ctx2, |ui| {
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if task.is_completed {
+                            ui.colored_label(
+                                Color32::from_rgb(140, 200, 140),
+                                "✓ 完了",
+                            );
+                        } else {
+                            ui.label("○ 未完了");
+                        }
+                        ui.separator();
+                        ui.label("優先度:");
+                        let prio_label = match task.priority {
+                            Priority::High => "高",
+                            Priority::Medium => "中",
+                            Priority::Low => "低",
+                            Priority::None => "なし",
+                        };
+                        ui.label(prio_label);
+                        if let Some(dt) = task.scheduled_date_time {
+                            ui.separator();
+                            ui.label("予定:");
+                            ui.label(dt.format("%Y-%m-%d %H:%M").to_string());
+                        }
+                    });
+                    ui.add_space(4.0);
+                });
+
+                // ─── 下段: 操作ボタン ───
+                egui::TopBottomPanel::bottom("tv_buttons").show(ctx2, |ui| {
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if self.viewing_task_edit_mode {
+                            if ui.button("💾 保存").clicked() {
+                                save_content =
+                                    Some(self.viewing_task_edit_buf.clone());
+                                self.viewing_task_edit_mode = false;
+                            }
+                            if ui.button("キャンセル").clicked() {
+                                self.viewing_task_edit_buf =
+                                    task.task_content.clone();
+                                self.viewing_task_edit_mode = false;
+                            }
+                        } else {
+                            if ui.button("✏ 編集").clicked() {
+                                self.viewing_task_edit_buf =
+                                    task.task_content.clone();
+                                self.viewing_task_edit_mode = true;
+                            }
+                            if ui
+                                .button("📋 同じタスク作成")
+                                .on_hover_text(
+                                    "同じ内容で新規タスクを作成し、編集モードで開きます",
+                                )
+                                .clicked()
+                            {
+                                duplicate_request = true;
+                            }
+                            if ui.button("閉じる").clicked() {
+                                close = true;
+                            }
+                        }
+                    });
+                    ui.add_space(6.0);
+                });
+
+                // ─── 中段: 本文 ───
+                egui::CentralPanel::default().show(ctx2, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if self.viewing_task_edit_mode {
+                                ui.add_sized(
+                                    ui.available_size(),
+                                    egui::TextEdit::multiline(
+                                        &mut self.viewing_task_edit_buf,
+                                    )
+                                    .desired_rows(8),
+                                );
+                            } else if task.task_content.trim().is_empty() {
+                                ui.weak("(本文なし)");
+                            } else {
+                                // URL をリンク化して描画。クリックで rundll32 経由で
+                                // 既定ブラウザを開く（cmd の & 問題回避済み）。
+                                let segments =
+                                    split_url_segments(&task.task_content);
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 0.0;
+                                    for seg in segments {
+                                        match seg {
+                                            TextSegment::Text(t) => {
+                                                // 改行を保つために行ごとに描画
+                                                let mut first = true;
+                                                for line in t.split('\n') {
+                                                    if !first {
+                                                        ui.end_row();
+                                                    }
+                                                    if !line.is_empty() {
+                                                        ui.label(line);
+                                                    }
+                                                    first = false;
+                                                }
+                                            }
+                                            TextSegment::Url(u) => {
+                                                let resp = ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(&u)
+                                                            .color(
+                                                                Color32::from_rgb(
+                                                                    100, 170,
+                                                                    240,
+                                                                ),
+                                                            )
+                                                            .underline(),
+                                                    )
+                                                    .sense(
+                                                        egui::Sense::click(),
+                                                    ),
+                                                );
+                                                if resp.hovered() {
+                                                    ctx2.set_cursor_icon(
+                                                        egui::CursorIcon::PointingHand,
+                                                    );
+                                                }
+                                                if resp.clicked() {
+                                                    open_url(&u);
+                                                }
+                                                resp.on_hover_text(&u);
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                        });
+                });
+
+                // 閉じる条件: × / ESC
+                if ctx2.input(|i| i.viewport().close_requested()) {
+                    close = true;
+                }
+                if ctx2.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    if self.viewing_task_edit_mode {
+                        // 編集中の ESC は編集キャンセル（ウィンドウは閉じない）
+                        self.viewing_task_edit_buf = task.task_content.clone();
+                        self.viewing_task_edit_mode = false;
+                    } else {
+                        close = true;
+                    }
+                }
+            },
+        );
+
+        // 保存要求があればタスクへ書き戻し
+        if let Some(new_content) = save_content {
+            if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id) {
+                if t.task_content != new_content {
+                    t.task_content = new_content;
+                    t.touch();
+                    self.dirty_tasks = true;
+                }
+            }
+        }
+
+        // 複製要求: タイトル/優先度/予定日時 を引き継いだ新規タスクを作成し、
+        // 既存ウィンドウを閉じて新タスクのビューワを編集モードで開く。
+        if duplicate_request {
+            let next_order = self
+                .tasks
+                .iter()
+                .map(|t| t.manual_order)
+                .max()
+                .unwrap_or(0)
+                + 1;
+            let mut new_task = Item::new_task(task.task_content.clone(), next_order);
+            new_task.priority = task.priority;
+            new_task.scheduled_date_time = task.scheduled_date_time;
+            let new_id = new_task.id.clone();
+            let new_content = new_task.task_content.clone();
+            self.tasks.push(new_task);
+            self.dirty_tasks = true;
+            // 既存ウィンドウは上書きで閉じ、新規タスクの編集モードで再オープン
+            self.viewing_task_id = Some(new_id);
+            self.viewing_task_edit_mode = true;
+            self.viewing_task_edit_buf = new_content;
+        } else if close {
+            self.viewing_task_id = None;
+            self.viewing_task_edit_mode = false;
+            self.viewing_task_edit_buf.clear();
         }
     }
 
@@ -623,8 +1488,9 @@ impl App {
         }
     }
 
-    /// サイドカーを起動して標準出力をログに流す
-    fn start_sync(&mut self, sc: &storage::SidecarInfo) {
+    /// サイドカーを起動して標準出力をログに流す。
+    /// `is_auto = true` の場合はログウィンドウを自動表示せず、終了時に静かに閉じる。
+    fn start_sync(&mut self, sc: &storage::SidecarInfo, is_auto: bool) {
         let (tx, rx) = channel();
         let exe_dir = storage::data_dir_path();
         let mut cmd = Command::new(&sc.path);
@@ -677,7 +1543,8 @@ impl App {
                     log: Vec::new(),
                     exit_code: None,
                 });
-                self.show_sync_log = true;
+                self.current_sync_is_auto = is_auto;
+                self.show_sync_log = !is_auto;
             }
             Err(e) => {
                 let (_, dummy_rx) = channel::<SyncMsg>();
@@ -689,7 +1556,8 @@ impl App {
                     log: vec![format!("起動失敗: {e}")],
                     exit_code: Some(-1),
                 });
-                self.show_sync_log = true;
+                self.current_sync_is_auto = is_auto;
+                self.show_sync_log = !is_auto;
             }
         }
     }
@@ -730,9 +1598,25 @@ impl App {
         if self.new_task_use_date {
             task.scheduled_date_time = self.new_task_buf.to_dt();
         }
+        // PC操作の選択値を保存しつつタスクを追加（PC操作は予定日時 ON 時のみ有効）
+        let pc_action = if self.new_task_use_date {
+            self.new_task_pc_action
+        } else {
+            PcAction::None
+        };
         self.tasks.push(task);
+        let new_idx = self.tasks.len() - 1;
         self.new_task_text.clear();
         self.dirty_tasks = true;
+        // PC操作 != None かつ PCReminder 検出済み → 該当コマンドを即時予約。
+        // register_pc_action 内で「過去時刻」「pc-reminder 未配置」等も検証し、
+        // 失敗時は上部にバナー警告。タスク自体は作成成功のまま残る。
+        if pc_action != PcAction::None && self.is_tool_available("pc-reminder-gui") {
+            self.register_pc_action(new_idx, pc_action);
+        }
+        // タスクが追加されたら（追加ボタン・ショートカット問わず）設定の初期値にリセット。
+        // タスクごとに PC 操作を再選択させ、前のタスクの選択が次に持ち越されないようにする。
+        self.new_task_pc_action = self.settings.pc_action_default;
     }
 
     fn new_note(&mut self) {
@@ -931,9 +1815,15 @@ enum RowAction {
     SetPriority(Priority),
     EditDate,
     Delete,
+    SetReminder,
+    ClearReminder,
 }
 
-fn row_menu(ui: &mut egui::Ui) -> Option<RowAction> {
+fn row_menu(
+    ui: &mut egui::Ui,
+    has_reminder: bool,
+    pcr_available: bool,
+) -> Option<RowAction> {
     let mut action = None;
     ui.label("重要度を設定");
     for p in [Priority::High, Priority::Medium, Priority::Low, Priority::None] {
@@ -945,6 +1835,18 @@ fn row_menu(ui: &mut egui::Ui) -> Option<RowAction> {
     ui.separator();
     if ui.button("📅 予定日時を編集").clicked() {
         action = Some(RowAction::EditDate);
+        ui.close_menu();
+    }
+    // リマインダー項目: PCReminder 検出時のみ「登録」を出す。
+    // 既に登録済 (reminder_key が残っている) なら、PCReminder が未検出でも
+    // 「解除」だけは表示してローカル状態をクリーンアップできるようにする。
+    if has_reminder {
+        if ui.button("🔕 リマインダーを解除").clicked() {
+            action = Some(RowAction::ClearReminder);
+            ui.close_menu();
+        }
+    } else if pcr_available && ui.button("🔔 リマインダーを登録").clicked() {
+        action = Some(RowAction::SetReminder);
         ui.close_menu();
     }
     if ui.button("🗑 削除").clicked() {
@@ -994,10 +1896,126 @@ fn clamp_pos(pos: [f32; 2], size: [f32; 2], mon: [f32; 2]) -> [f32; 2] {
     [pos[0].clamp(0.0, maxx), pos[1].clamp(0.0, maxy)]
 }
 
+/// テキスト中の URL を検出してテキスト/URL のセグメント列に分解する。
+/// http:// または https:// を URL とみなし、空白文字直前まで取り込む。
+/// 末尾の句読点・括弧（"。、，．,.;:!?)]}」』>"）は URL から外す。
+pub enum TextSegment {
+    Text(String),
+    Url(String),
+}
+
+/// 与えられた幅 `max_width` (px) に収まるよう文字単位で切り詰めて
+/// 末尾に "…" を付けた文字列を返す（全文が収まればそのまま返す）。
+///
+/// 用途: egui の `Label::truncate()` は省略時に自動で全文ツールチップを出し、
+/// 本文プレビューと二重表示になるため、それを避けるための自前 truncate。
+fn truncate_to_fit(ui: &egui::Ui, text: &str, max_width: f32) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let font_id = ui
+        .style()
+        .text_styles
+        .get(&egui::TextStyle::Body)
+        .cloned()
+        .unwrap_or_else(|| egui::FontId::default());
+    ui.fonts(|fonts| {
+        let full_w: f32 = text
+            .chars()
+            .map(|c| fonts.glyph_width(&font_id, c))
+            .sum();
+        if full_w <= max_width {
+            return text.to_string();
+        }
+        let ellipsis_w = fonts.glyph_width(&font_id, '…');
+        let budget = (max_width - ellipsis_w).max(0.0);
+        let mut width = 0.0_f32;
+        let mut out = String::with_capacity(text.len());
+        for ch in text.chars() {
+            let gw = fonts.glyph_width(&font_id, ch);
+            if width + gw > budget {
+                break;
+            }
+            width += gw;
+            out.push(ch);
+        }
+        out.push('…');
+        out
+    })
+}
+
+pub fn split_url_segments(s: &str) -> Vec<TextSegment> {
+    let mut out: Vec<TextSegment> = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    let mut buf = String::new();
+    while i < bytes.len() {
+        // i は char 境界（ASCII プレフィックス検査のため境界判定は不要）
+        let rest = &s[i..];
+        let scheme_len = if rest.starts_with("https://") {
+            "https://".len()
+        } else if rest.starts_with("http://") {
+            "http://".len()
+        } else {
+            0
+        };
+        if scheme_len > 0 {
+            // URL 開始: 空白までを切り出す
+            let end_rel = rest
+                .find(|c: char| c.is_whitespace())
+                .unwrap_or(rest.len());
+            let mut url = &rest[..end_rel];
+            // 末尾のノイズ記号を削る（マッチした分だけ後ろから戻す）
+            let trim_chars: &[char] = &[
+                '。', '、', ',', '.', ';', ':', '!', '?', ')', ']', '}',
+                '」', '』', '>', '"', '\'',
+            ];
+            while let Some(last) = url.chars().last() {
+                if trim_chars.contains(&last) {
+                    url = &url[..url.len() - last.len_utf8()];
+                } else {
+                    break;
+                }
+            }
+            // スキームより長い = ホスト部があるならリンク化、
+            // ちょうどスキームだけ（例: "https://"）ならテキスト扱い。
+            if url.len() <= scheme_len {
+                buf.push_str(&rest[..end_rel]);
+                i += end_rel;
+                continue;
+            }
+            // 直前まで溜まったテキストを flush
+            if !buf.is_empty() {
+                out.push(TextSegment::Text(std::mem::take(&mut buf)));
+            }
+            out.push(TextSegment::Url(url.to_string()));
+            // 削った末尾記号 + URL 後の残りはテキストに送る
+            let consumed_url_full = &rest[..end_rel];
+            let tail = &consumed_url_full[url.len()..];
+            if !tail.is_empty() {
+                buf.push_str(tail);
+            }
+            i += end_rel;
+        } else {
+            // 1 char 進める
+            let ch = rest.chars().next().unwrap();
+            buf.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    if !buf.is_empty() {
+        out.push(TextSegment::Text(buf));
+    }
+    out
+}
+
 #[cfg(windows)]
 fn open_url(url: &str) {
-    let _ = std::process::Command::new("cmd")
-        .args(["/C", "start", "", url])
+    // `cmd /C start "" URL` は URL 内の `&` を cmd がコマンド区切りとして
+    // 解釈してしまうため避ける（クエリ文字列が途切れる）。rundll32 経由で
+    // Windows のシェル関連付けに渡す方式が安全。
+    let _ = std::process::Command::new("rundll32.exe")
+        .args(["url.dll,FileProtocolHandler", url])
         .spawn();
 }
 
@@ -1077,6 +2095,9 @@ fn draw_thumbnail(
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // フレーム冒頭でプレビュー要求をリセット（ホバー検出側が再セットする）
+        self.pending_preview = None;
+
         // ===== ウィンドウ状態の観測 =====
         let focused = ctx.input(|i| {
             let vp = i.viewport();
@@ -1160,6 +2181,20 @@ impl eframe::App for App {
                 (Small, FontId::new(size * 0.85, Proportional)),
             ]
             .into();
+            // スクロールバーを常時表示に。
+            // floating=false にして 8px 幅の固定バーにする。
+            // ハンドル（位置を示す白いつまみ）は foreground 色＋常時不透明、
+            // 背景レール（track）は薄い半透明で常時うっすら見える状態。
+            let sc = &mut s.spacing.scroll;
+            sc.floating = false;
+            sc.bar_width = 8.0;
+            sc.foreground_color = true;
+            sc.dormant_background_opacity = 0.3;
+            sc.dormant_handle_opacity = 1.0;
+            sc.interact_background_opacity = 0.4;
+            sc.interact_handle_opacity = 1.0;
+            sc.active_background_opacity = 0.5;
+            sc.active_handle_opacity = 1.0;
         });
 
         // ===== タブバー =====
@@ -1223,7 +2258,7 @@ impl eframe::App for App {
                         );
                         if let Some(i) = run_idx {
                             if let Some(sc) = self.sidecars.get(i).cloned() {
-                                self.start_sync(&sc);
+                                self.start_sync(&sc, false);
                             }
                         }
                         if do_refresh {
@@ -1244,19 +2279,28 @@ impl eframe::App for App {
             ui.add_space(3.0);
             match self.mode {
                 Mode::Task => {
+                    // ── 1段目: 関連ツール起動ボタン + 並び ──
                     ui.horizontal_wrapped(|ui| {
-                        let resp = ui.add(
-                            egui::TextEdit::singleline(&mut self.new_task_text)
-                                .hint_text("新しいタスクを入力して Enter")
-                                .desired_width(200.0),
-                        );
-                        let enter = resp.lost_focus()
-                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        if ui.button("追加").clicked() || enter {
-                            self.add_task();
-                            resp.request_focus();
+                        // 関連ツール（プラグイン）起動ボタン
+                        if !self.tools.is_empty() {
+                            let mut launch_idx: Option<usize> = None;
+                            for (i, t) in self.tools.iter().enumerate() {
+                                if ui
+                                    .button(t.icon)
+                                    .on_hover_text(&t.display_name)
+                                    .clicked()
+                                {
+                                    launch_idx = Some(i);
+                                }
+                            }
+                            if let Some(i) = launch_idx {
+                                if let Some(t) = self.tools.get(i).cloned() {
+                                    self.launch_tool(&t);
+                                }
+                            }
+                            ui.separator();
                         }
-                        ui.label("  並び:");
+                        ui.label("並び:");
                         egui::ComboBox::from_id_salt("sort")
                             .selected_text(self.settings.sort_mode.label())
                             .show_ui(ui, |ui| {
@@ -1276,15 +2320,126 @@ impl eframe::App for App {
                                 }
                             });
                     });
-                    ui.horizontal_wrapped(|ui| {
-                        ui.checkbox(&mut self.new_task_use_date, "予定日時");
-                        let use_date = self.new_task_use_date;
-                        ui.add_enabled_ui(use_date, |ui| {
-                            date_fields(ui, &mut self.new_task_buf);
-                            if ui.small_button("今すぐ").clicked() {
-                                self.new_task_buf = DateBuf::now();
+                    // ── 2段目: 予定日時。非折り返しの ui.horizontal を行単位で並べる。
+                    //    日付・時刻は atomic（途中で折り返さない=要件）。
+                    //    幅を安全側に過大評価して事前に行割りするので、時刻は絶対に
+                    //    "時:分" の途中で折り返されない。 ──
+                    let use_date = self.new_task_use_date;
+                    // 予定日時 OFF なら PC操作も自動で「通知なし」に戻す
+                    if !use_date && self.new_task_pc_action != PcAction::None {
+                        self.new_task_pc_action = PcAction::None;
+                    }
+                    #[derive(Clone, Copy, PartialEq)]
+                    enum Atom {
+                        Check,
+                        Date,
+                        Time,
+                        Now,
+                        Pc,
+                    }
+                    // 各要素の概算幅。DragValue を add（自然サイズ）で描画するため
+                    // 余裕を持って大きめに設定（時刻消失防止）。
+                    // PC操作ボタンは PCReminder 検出時のみ含める。
+                    let mut atoms: Vec<(Atom, f32)> = vec![
+                        (Atom::Check, 100.0),
+                        (Atom::Date, 130.0),
+                        (Atom::Time, 76.0),
+                        (Atom::Now, 70.0),
+                    ];
+                    if self.is_tool_available("pc-reminder-gui") {
+                        atoms.push((Atom::Pc, 84.0));
+                    }
+                    let avail = ui.available_width();
+                    let mut rows: Vec<Vec<Atom>> = Vec::new();
+                    let mut cur: Vec<Atom> = Vec::new();
+                    let mut used = 0.0_f32;
+                    for (a, w) in atoms {
+                        if !cur.is_empty() && used + w > avail {
+                            rows.push(std::mem::take(&mut cur));
+                            used = 0.0;
+                        }
+                        cur.push(a);
+                        used += w;
+                    }
+                    if !cur.is_empty() {
+                        rows.push(cur);
+                    }
+                    for row in rows {
+                        let has_check = row.contains(&Atom::Check);
+                        ui.horizontal(|ui| {
+                            if !has_check && !use_date {
+                                ui.disable();
+                            }
+                            for a in row {
+                                match a {
+                                    Atom::Check => {
+                                        ui.checkbox(
+                                            &mut self.new_task_use_date,
+                                            "予定日時",
+                                        );
+                                        if !use_date {
+                                            ui.disable();
+                                        }
+                                    }
+                                    Atom::Date => {
+                                        date_part(ui, &mut self.new_task_buf);
+                                    }
+                                    Atom::Time => {
+                                        time_part(ui, &mut self.new_task_buf);
+                                    }
+                                    Atom::Now => {
+                                        if ui.small_button("今すぐ").clicked() {
+                                            self.new_task_buf = DateBuf::now();
+                                        }
+                                    }
+                                    Atom::Pc => {
+                                        // クリックで「通知なし→通知あり→起動→スリープ→…」を循環。
+                                        // タスクが追加された時点の選択値で予約される
+                                        // （追加ボタンクリック・ショートカット入力どちらでも同じ）。
+                                        let label = self.new_task_pc_action.label();
+                                        if ui
+                                            .button(label)
+                                            .on_hover_text(
+                                                "クリックで PC 操作を切替\n通知なし / 通知あり / 起動(+通知) / スリープ\n→ tools/pc-reminder.exe が必要",
+                                            )
+                                            .clicked()
+                                        {
+                                            self.new_task_pc_action =
+                                                self.new_task_pc_action.next();
+                                        }
+                                    }
+                                }
                             }
                         });
+                    }
+                    self.new_task_buf.clamp();
+                    // ── 3段目: タスク入力欄 + 追加 ──
+                    ui.horizontal_wrapped(|ui| {
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.new_task_text)
+                                .hint_text("新しいタスクを入力")
+                                .desired_width(200.0),
+                        );
+                        // 登録キー設定に応じて Enter 系での登録を判定（既定: なし）
+                        let key_add = resp.lost_focus()
+                            && ui.input(|i| match self.settings.add_task_key {
+                                AddTaskKey::None => false,
+                                AddTaskKey::Enter => {
+                                    i.key_pressed(egui::Key::Enter)
+                                        && !i.modifiers.shift
+                                        && !i.modifiers.ctrl
+                                }
+                                AddTaskKey::ShiftEnter => {
+                                    i.key_pressed(egui::Key::Enter) && i.modifiers.shift
+                                }
+                                AddTaskKey::CtrlEnter => {
+                                    i.key_pressed(egui::Key::Enter) && i.modifiers.ctrl
+                                }
+                            });
+                        if ui.button("追加").clicked() || key_add {
+                            self.add_task();
+                            resp.request_focus();
+                        }
                     });
                 }
                 Mode::Note => {
@@ -1327,6 +2482,23 @@ impl eframe::App for App {
             });
         }
 
+        // ===== リマインダー登録/解除の結果通知 =====
+        if let Some(msg) = self.reminder_status.clone() {
+            let color = if self.reminder_status_is_error {
+                Color32::from_rgb(220, 100, 100)
+            } else {
+                Color32::from_rgb(120, 200, 120)
+            };
+            egui::TopBottomPanel::top("reminder_status").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.colored_label(color, msg);
+                    if ui.button("✕").clicked() {
+                        self.reminder_status = None;
+                    }
+                });
+            });
+        }
+
         // ===== メインコンテンツ =====
         let now = Local::now().naive_local();
         let far = self.settings.far_format;
@@ -1335,13 +2507,14 @@ impl eframe::App for App {
         let manual_mode = self.settings.sort_mode == SortMode::Manual;
         let order = self.task_display_order();
 
-        // タスクリスト用の操作バッファ
-        let mut set_priority: Option<(usize, Priority)> = None;
-        let mut delete_task_idx: Option<usize> = None;
-        let mut open_date_idx: Option<usize> = None;
+        // タスクリスト用のホバー追跡（手動 DnD 用）
         let mut hovered_row: Option<usize> = None;
+        // 時刻ラベルクリックで日時編集ダイアログを開く用
+        let mut open_date_idx: Option<usize> = None;
         // メモリスト用
         let mut open_note_id: Option<String> = None;
+        // タスク内容ビューワを開く対象（既存がある場合は閉じてから差し替え）
+        let mut open_view_task_id: Option<String> = None;
 
         egui::CentralPanel::default().show(ctx, |ui| {
             match self.mode {
@@ -1376,6 +2549,8 @@ impl eframe::App for App {
                                         };
                                         let dirty = &mut self.dirty_tasks;
                                         let open_date_ref = &mut open_date_idx;
+                                        let open_view_ref = &mut open_view_task_id;
+                                        let preview_ref = &mut self.pending_preview;
                                         let fr = egui::Frame::none()
                                             .fill(fill)
                                             .inner_margin(egui::Margin::symmetric(6.0, 4.0))
@@ -1415,6 +2590,14 @@ impl eframe::App for App {
                                                     {
                                                         *open_date_ref = Some(i);
                                                     }
+                                                    if task.reminder_key.is_some() {
+                                                        ui.label(
+                                                            RichText::new("🔔").small(),
+                                                        )
+                                                        .on_hover_text(
+                                                            "リマインダー登録済（右クリックで解除）",
+                                                        );
+                                                    }
                                                     ui.with_layout(
                                                         egui::Layout::right_to_left(
                                                             egui::Align::Center,
@@ -1435,30 +2618,97 @@ impl eframe::App for App {
                                                                     },
                                                                 );
                                                             }
-                                                            if task.is_completed {
-                                                                ui.add(
-                                                                    egui::Label::new(
-                                                                        RichText::new(
-                                                                            &task.task_content,
-                                                                        )
-                                                                        .strikethrough()
-                                                                        .weak(),
-                                                                    )
-                                                                    .truncate(),
-                                                                );
+                                                            // 完了・未完了とも Label に統一。
+                                                            // クリック = ミニウィンドウ起動（編集はミニ内で行う）。
+                                                            // egui の .truncate() は省略時に
+                                                            // 自動で全文ツールチップを出してしまう。
+                                                            // tooltip_delay 上書きは
+                                                            // tooltip_grace_time のせいで他ツール
+                                                            // チップ直後だと効かないため、
+                                                            // 自前で幅計算→文字数truncate→
+                                                            // wrap_mode(Extend) で表示する
+                                                            // （elision 自体を起こさない）。
+                                                            // さらに親が right_to_left なので、
+                                                            // 残りスペース全体を left_to_right で
+                                                            // 切り取り、その中で左揃え描画する。
+                                                            // ドラッグハンドル ⠿ との視覚的な
+                                                            // かぶりを避けるため、ラベル領域から
+                                                            // 12px ぶん余白を引いておく。
+                                                            const HANDLE_GAP: f32 = 12.0;
+                                                            let avail_w =
+                                                                (ui.available_width() - HANDLE_GAP)
+                                                                    .max(40.0);
+                                                            let row_h =
+                                                                ui.spacing().interact_size.y;
+                                                            let display = truncate_to_fit(
+                                                                ui,
+                                                                &task.task_content,
+                                                                avail_w,
+                                                            );
+                                                            let rt = if task.is_completed {
+                                                                RichText::new(&display)
+                                                                    .strikethrough()
+                                                                    .weak()
                                                             } else {
-                                                                let r = ui.add(
-                                                                    egui::TextEdit::singleline(
-                                                                        &mut task.task_content,
-                                                                    )
-                                                                    .frame(false)
-                                                                    .desired_width(f32::INFINITY),
-                                                                );
-                                                                if r.changed() {
-                                                                    task.touch();
-                                                                    *dirty = true;
-                                                                }
-                                                            }
+                                                                RichText::new(&display)
+                                                            };
+                                                            ui.allocate_ui_with_layout(
+                                                                egui::vec2(avail_w, row_h),
+                                                                egui::Layout::left_to_right(
+                                                                    egui::Align::Center,
+                                                                ),
+                                                                |ui| {
+                                                                    let lbl_resp = ui.add(
+                                                                        egui::Label::new(rt)
+                                                                            .wrap_mode(
+                                                                                egui::TextWrapMode::Extend,
+                                                                            )
+                                                                            .selectable(false)
+                                                                            .sense(
+                                                                                egui::Sense::click(),
+                                                                            ),
+                                                                    );
+                                                                    if lbl_resp.hovered() {
+                                                                        *preview_ref = Some(
+                                                                            task.task_content
+                                                                                .clone(),
+                                                                        );
+                                                                    }
+                                                                    if lbl_resp.clicked() {
+                                                                        *open_view_ref = Some(
+                                                                            task_id.clone(),
+                                                                        );
+                                                                    }
+                                                                    // 残り空白部分もクリック/
+                                                                    // ホバーターゲットに含める。
+                                                                    let remaining_w =
+                                                                        ui.available_width();
+                                                                    if remaining_w > 1.0 {
+                                                                        let (rect, gap_resp) =
+                                                                            ui.allocate_exact_size(
+                                                                                egui::vec2(
+                                                                                    remaining_w,
+                                                                                    row_h,
+                                                                                ),
+                                                                                egui::Sense::click(),
+                                                                            );
+                                                                        let _ = rect;
+                                                                        if gap_resp.hovered() {
+                                                                            *preview_ref = Some(
+                                                                                task.task_content
+                                                                                    .clone(),
+                                                                            );
+                                                                        }
+                                                                        if gap_resp.clicked() {
+                                                                            *open_view_ref =
+                                                                                Some(
+                                                                                    task_id
+                                                                                        .clone(),
+                                                                                );
+                                                                        }
+                                                                    }
+                                                                },
+                                                            );
                                                         },
                                                     );
                                                 });
@@ -1467,29 +2717,21 @@ impl eframe::App for App {
                                         if row_resp.contains_pointer() {
                                             hovered_row = Some(i);
                                         }
-                                        let popup_id =
-                                            ui.make_persistent_id(("ctxmenu", &task_id));
+                                        // 右クリック検出 → 別ウィンドウメニューを開く準備
+                                        // （位置は行の左下のスクリーン絶対座標）
                                         if row_resp.contains_pointer()
                                             && ui.input(|inp| inp.pointer.secondary_clicked())
                                         {
-                                            ui.memory_mut(|m| m.open_popup(popup_id));
-                                        }
-                                        let action = egui::popup_below_widget(
-                                            ui,
-                                            popup_id,
-                                            &row_resp,
-                                            egui::PopupCloseBehavior::CloseOnClick,
-                                            |ui| row_menu(ui),
-                                        )
-                                        .flatten();
-                                        if let Some(a) = action {
-                                            match a {
-                                                RowAction::SetPriority(p) => {
-                                                    set_priority = Some((i, p))
-                                                }
-                                                RowAction::EditDate => open_date_idx = Some(i),
-                                                RowAction::Delete => delete_task_idx = Some(i),
-                                            }
+                                            let inner_min = ui
+                                                .input(|i| i.viewport().inner_rect)
+                                                .map(|r| r.min)
+                                                .unwrap_or(egui::pos2(0.0, 0.0));
+                                            let sx = inner_min.x + row_resp.rect.left();
+                                            let sy = inner_min.y + row_resp.rect.bottom();
+                                            self.context_menu_task_id =
+                                                Some(task_id.clone());
+                                            self.context_menu_screen_pos =
+                                                Some([sx, sy]);
                                         }
                                     }
                                 });
@@ -1681,21 +2923,9 @@ impl eframe::App for App {
             }
         });
 
-        // ===== ループ後: タスク操作適用 =====
-        if let Some((i, p)) = set_priority {
-            if let Some(t) = self.tasks.get_mut(i) {
-                t.priority = p;
-                t.touch();
-                self.dirty_tasks = true;
-            }
-        }
-        if let Some(i) = delete_task_idx {
-            if i < self.tasks.len() {
-                self.tasks.remove(i);
-                self.renumber_tasks();
-                self.dirty_tasks = true;
-            }
-        }
+        // ===== ループ後: 時刻ラベルクリック → 日時編集ダイアログ =====
+        // タスクの右クリックメニュー由来のアクション（重要度/削除/リマインダー）は
+        // draw_context_menu で直接実行されるため、ここでは扱わない。
         if let Some(i) = open_date_idx {
             if let Some(t) = self.tasks.get(i) {
                 self.edit_buf = t
@@ -1708,6 +2938,19 @@ impl eframe::App for App {
         if let Some(id) = open_note_id {
             self.editing_note = Some(id);
             self.focus_editor = true;
+        }
+        // ===== ループ後: タスクをクリック → ミニウィンドウを開く =====
+        // 既存ウィンドウがあれば差し替え（ユーザー指示: 既存を閉じて開く）
+        if let Some(id) = open_view_task_id {
+            let buf = self
+                .tasks
+                .iter()
+                .find(|t| t.id == id)
+                .map(|t| t.task_content.clone())
+                .unwrap_or_default();
+            self.viewing_task_id = Some(id);
+            self.viewing_task_edit_mode = false;
+            self.viewing_task_edit_buf = buf;
         }
 
         // ===== タスク日時編集ウィンドウ =====
@@ -2126,6 +3369,124 @@ impl eframe::App for App {
                             }
                             ui.end_row();
 
+                            // ─ 自動同期 ─
+                            ui.label("自動同期");
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .checkbox(
+                                        &mut self.settings.auto_sync_on_startup,
+                                        "起動時に実行",
+                                    )
+                                    .changed()
+                                {
+                                    self.dirty_tasks = true;
+                                }
+                                ui.add_space(8.0);
+                                ui.label("間隔(分):");
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(
+                                            &mut self.settings.auto_sync_interval_min,
+                                        )
+                                        .range(0..=1440)
+                                        .speed(1.0)
+                                        .custom_formatter(|n, _| {
+                                            if n <= 0.0 {
+                                                "off".into()
+                                            } else {
+                                                format!("{}", n as u32)
+                                            }
+                                        }),
+                                    )
+                                    .changed()
+                                {
+                                    self.dirty_tasks = true;
+                                }
+                                ui.weak("（0で定期同期オフ）");
+                            });
+                            ui.end_row();
+
+                            // ─ 関連ツール（プラグイン）検出状況 ─
+                            // 起動はタスクモードのツールバーから行う。ここは状況表示のみ。
+                            ui.label("関連ツール");
+                            ui.vertical(|ui| {
+                                // 検出状況の表示（元の見た目を維持）
+                                let known: &[(&str, &str)] = &[
+                                    ("simplecalendar", "📅 SimpleCalendar"),
+                                    ("pc-reminder-gui", "⏰ PCReminder"),
+                                ];
+                                for (key, label) in known {
+                                    let installed = self.is_tool_available(key);
+                                    let (mark, color) = if installed {
+                                        ("✅ 検出済", Color32::from_rgb(120, 200, 120))
+                                    } else {
+                                        ("— 未検出", Color32::from_rgb(170, 170, 170))
+                                    };
+                                    ui.horizontal(|ui| {
+                                        ui.label(*label);
+                                        ui.colored_label(color, mark);
+                                    });
+                                }
+                                ui.add_space(2.0);
+                                // リスト再スキャン
+                                if ui.small_button("🔄 リスト再スキャン").clicked() {
+                                    self.tools = storage::discover_tools(
+                                        &self.settings.manual_tool_paths,
+                                    );
+                                }
+                                // 「登録(検出されない時)」ボタン: 常時表示。
+                                // 選んだ exe のファイル名から既知ツールを自動判定して登録する。
+                                // 検出済ツールでも、ここから選び直せばパスを上書き登録できる。
+                                let entries = storage::known_tool_entries();
+                                let mut do_register = false;
+                                if ui.small_button("登録(検出されない時)").clicked() {
+                                    do_register = true;
+                                }
+                                if do_register {
+                                    if let Some(picked) = rfd::FileDialog::new()
+                                        .add_filter("実行ファイル", &["exe"])
+                                        .set_title("未検出ツールの exe を選択")
+                                        .pick_file()
+                                    {
+                                        let picked_name = picked
+                                            .file_name()
+                                            .map(|n| n.to_string_lossy().to_ascii_lowercase())
+                                            .unwrap_or_default();
+                                        // ファイル名で既知ツールを自動判定
+                                        let matched = entries.iter().find(|(_, _, fname)| {
+                                            fname.to_ascii_lowercase() == picked_name
+                                        });
+                                        match matched {
+                                            Some((key, label, _)) => {
+                                                self.settings.manual_tool_paths.insert(
+                                                    key.clone(),
+                                                    picked.to_string_lossy().to_string(),
+                                                );
+                                                self.tools = storage::discover_tools(
+                                                    &self.settings.manual_tool_paths,
+                                                );
+                                                self.tool_status = Some(format!(
+                                                    "✅ {} を登録しました",
+                                                    label
+                                                ));
+                                                self.dirty_tasks = true;
+                                            }
+                                            None => {
+                                                self.tool_status = Some(format!(
+                                                    "⚠ 既知のツール名と一致しません ({})",
+                                                    picked_name
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(msg) = &self.tool_status {
+                                    ui.add_space(2.0);
+                                    ui.weak(msg);
+                                }
+                            });
+                            ui.end_row();
+
                             // ─ メモ設定 ─
                             ui.separator();
                             ui.label("── メモ設定 ──");
@@ -2210,6 +3571,67 @@ impl eframe::App for App {
                             ui.separator();
                             ui.label("── タスク設定 ──");
                             ui.end_row();
+
+                            // タスク登録キー
+                            ui.label("タスク登録キー")
+                                .on_hover_text(
+                                    "タスク入力欄でタスクを登録するキー。\n誤登録を防ぐため既定は「なし」（追加ボタンのみ）。",
+                                );
+                            egui::ComboBox::from_id_salt("add_task_key")
+                                .selected_text(self.settings.add_task_key.label())
+                                .show_ui(ui, |ui| {
+                                    for k in [
+                                        AddTaskKey::None,
+                                        AddTaskKey::Enter,
+                                        AddTaskKey::ShiftEnter,
+                                        AddTaskKey::CtrlEnter,
+                                    ] {
+                                        if ui
+                                            .selectable_value(
+                                                &mut self.settings.add_task_key,
+                                                k,
+                                                k.label(),
+                                            )
+                                            .changed()
+                                        {
+                                            self.dirty_tasks = true;
+                                        }
+                                    }
+                                });
+                            ui.end_row();
+
+                            // PC操作の初期値（起動時と、タスクが追加されたタイミングで適用される値）
+                            // PCReminder 検出時のみ表示。
+                            if self.is_tool_available("pc-reminder-gui") {
+                                ui.label("PC操作の初期値").on_hover_text(
+                                    "「PC操作」ボタンが既定で選ぶ値。\n\
+                                     アプリ起動時、およびタスクが追加されたら（追加ボタン・ショートカットいずれの場合も）\nこの値にリセットされる。",
+                                );
+                                egui::ComboBox::from_id_salt("pc_action_default")
+                                    .selected_text(self.settings.pc_action_default.label())
+                                    .show_ui(ui, |ui| {
+                                        for a in [
+                                            PcAction::None,
+                                            PcAction::Notify,
+                                            PcAction::Wake,
+                                            PcAction::Sleep,
+                                        ] {
+                                            if ui
+                                                .selectable_value(
+                                                    &mut self.settings.pc_action_default,
+                                                    a,
+                                                    a.label(),
+                                                )
+                                                .changed()
+                                            {
+                                                // 起動中なら現在の new_task_pc_action も同期
+                                                self.new_task_pc_action = a;
+                                                self.dirty_tasks = true;
+                                            }
+                                        }
+                                    });
+                                ui.end_row();
+                            }
 
                             // 重要度カラー
                             ui.label("重要度カラー");
@@ -2302,6 +3724,19 @@ impl eframe::App for App {
             }
         }
 
+        // ===== タスク右クリックメニュー（別ビューポート） =====
+        if self.context_menu_task_id.is_some() {
+            self.draw_context_menu(ctx);
+        }
+
+        // ===== タスク内容ビューワ（別ビューポート） =====
+        if self.viewing_task_id.is_some() {
+            self.draw_task_viewer(ctx);
+        }
+
+        // ===== ホバープレビュー（別 OS ウィンドウ。タスク本文を右/左側に表示） =====
+        self.draw_hover_preview(ctx);
+
         // ===== 外部連携セットアップウィザード（別ビューポート） =====
         if self.show_setup_wizard {
             self.draw_setup_wizard(ctx);
@@ -2348,6 +3783,57 @@ impl eframe::App for App {
         }
         if sync_just_finished {
             self.reload_after_sync();
+            // 手動・自動を問わず last_auto_sync_at をリセット
+            // （手動同期した直後は定期同期を待たせる）
+            self.last_auto_sync_at = Instant::now();
+            if self.current_sync_is_auto {
+                // 自動同期: 失敗時のみバナー、成功時は無音
+                if let Some(active) = &self.active_sync {
+                    let code = active.exit_code.unwrap_or(-1);
+                    if code != 0 {
+                        self.status_msg = Some(format!(
+                            "⚠ {} の自動同期が失敗 (exit={code})。手動同期で詳細ログを確認してください",
+                            active.name
+                        ));
+                    }
+                }
+                self.active_sync = None;
+                self.current_sync_is_auto = false;
+            }
+        }
+
+        // ===== 自動同期スケジューラ =====
+        // active_sync が無い時にキューを処理 → 空なら起動条件をチェックして詰める。
+        // ビューワが編集モードの間は未保存編集の取りこぼし防止のため一時停止する
+        // （手動同期と日時編集ダイアログには影響しない）。
+        let pause_auto_sync = self.viewing_task_edit_mode;
+        if self.active_sync.is_none() && !pause_auto_sync {
+            if let Some(sc) = self.auto_sync_queue.pop_front() {
+                self.start_sync(&sc, true);
+            } else {
+                let need_startup =
+                    !self.startup_sync_done && self.settings.auto_sync_on_startup;
+                let interval_due = self.settings.auto_sync_interval_min > 0
+                    && self.last_auto_sync_at.elapsed()
+                        >= Duration::from_secs(
+                            self.settings.auto_sync_interval_min as u64 * 60,
+                        );
+                if (need_startup || interval_due) && !self.sidecars.is_empty() {
+                    for sc in &self.sidecars {
+                        self.auto_sync_queue.push_back(sc.clone());
+                    }
+                    self.startup_sync_done = true;
+                    // 次回トリガーまでの待機時刻をリセット
+                    self.last_auto_sync_at = Instant::now();
+                }
+            }
+        }
+
+        // 自動同期が有効な間は定期的に repaint してスケジューラを動かす
+        if self.settings.auto_sync_interval_min > 0
+            || !self.auto_sync_queue.is_empty()
+        {
+            ctx.request_repaint_after(Duration::from_secs(30));
         }
 
         // ===== サイドカー同期ログウィンドウ =====

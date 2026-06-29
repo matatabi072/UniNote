@@ -112,6 +112,67 @@ impl Default for PriorityColors {
     }
 }
 
+/// タスク追加時の PC 操作種別（PCReminder への予約内容）
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PcAction {
+    /// リマインダー登録なし
+    #[default]
+    None,
+    /// 通知のみ（pc-reminder /add_remind）
+    Notify,
+    /// PC 起動＋通知（pc-reminder /add_remind --wake）
+    Wake,
+    /// PC スリープ（pc-reminder /add_sleep、通知なし）
+    Sleep,
+}
+
+impl PcAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            PcAction::None => "通知なし",
+            PcAction::Notify => "通知あり",
+            PcAction::Wake => "起動",
+            PcAction::Sleep => "スリープ",
+        }
+    }
+    /// クリック時の循環: None → Notify → Wake → Sleep → None
+    pub fn next(self) -> Self {
+        match self {
+            PcAction::None => PcAction::Notify,
+            PcAction::Notify => PcAction::Wake,
+            PcAction::Wake => PcAction::Sleep,
+            PcAction::Sleep => PcAction::None,
+        }
+    }
+}
+
+/// タスク入力欄でタスクを登録するキー（誤登録防止のため既定は「なし＝追加ボタンのみ」）
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AddTaskKey {
+    /// キー登録なし（「追加」ボタンのみで登録）
+    #[default]
+    None,
+    /// Enter で登録
+    Enter,
+    /// Shift+Enter で登録
+    ShiftEnter,
+    /// Ctrl+Enter で登録
+    CtrlEnter,
+}
+
+impl AddTaskKey {
+    pub fn label(self) -> &'static str {
+        match self {
+            AddTaskKey::None => "なし（追加ボタンのみ）",
+            AddTaskKey::Enter => "Enter",
+            AddTaskKey::ShiftEnter => "Shift+Enter",
+            AddTaskKey::CtrlEnter => "Ctrl+Enter",
+        }
+    }
+}
+
 /// 統合設定（SimpleTask + SimpleNote の全設定を統合）
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Settings {
@@ -156,6 +217,37 @@ pub struct Settings {
     /// 設定ウィンドウの位置（メインウィンドウ左上からのオフセット [dx, dy]）
     #[serde(default)]
     pub settings_offset: Option<[f32; 2]>,
+    /// タスク入力欄でタスクを登録するキー
+    #[serde(default)]
+    pub add_task_key: AddTaskKey,
+    /// タスク追加時の PC 操作の初期値（タスク追加後もこの値にリセットされる）
+    #[serde(default)]
+    pub pc_action_default: PcAction,
+    /// 手動登録された関連ツールのパス（key → exe 絶対パス）。
+    /// 自動検出されなかった場合のフォールバック。
+    /// key 例: "simplecalendar" / "pc-reminder-gui"
+    #[serde(default)]
+    pub manual_tool_paths: std::collections::BTreeMap<String, String>,
+    /// 自動同期: アプリ起動時に1回だけ全サイドカーを同期する
+    #[serde(default = "default_true")]
+    pub auto_sync_on_startup: bool,
+    /// 自動同期: 起動中もこの間隔（分）で同期を繰り返す。0 で定期同期を無効化。
+    #[serde(default = "default_auto_sync_interval_min")]
+    pub auto_sync_interval_min: u32,
+    /// タスク内容ビューワ（ミニウィンドウ）のサイズ
+    #[serde(default)]
+    pub task_view_size: Option<[f32; 2]>,
+    /// タスク内容ビューワの位置（メインウィンドウ左上からのオフセット [dx, dy]）
+    #[serde(default)]
+    pub task_view_offset: Option<[f32; 2]>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_auto_sync_interval_min() -> u32 {
+    15
 }
 
 fn default_thumb_height() -> f32 {
@@ -184,6 +276,13 @@ impl Default for Settings {
             image_viewer_pos: None,
             settings_size: None,
             settings_offset: None,
+            add_task_key: AddTaskKey::None,
+            pc_action_default: PcAction::None,
+            manual_tool_paths: std::collections::BTreeMap::new(),
+            auto_sync_on_startup: true,
+            auto_sync_interval_min: 15,
+            task_view_size: None,
+            task_view_offset: None,
         }
     }
 }

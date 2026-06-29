@@ -245,9 +245,14 @@ pub(crate) fn urlencoded(s: &str) -> String {
 
 #[cfg(windows)]
 fn open_url(url: &str) -> std::io::Result<()> {
+    // 注意: `cmd /C start "" URL` で URL を渡すと、Rust の Command::args は
+    // スペースを含まない引数を quote しないため、cmd が URL 内の `&` を
+    // コマンド区切りとして解釈して `?client_id=…` までしかブラウザに届かない。
+    // → response_type 等が欠落して Google が invalid_request を返す。
+    // rundll32 経由なら cmd を介さないのでこの問題が起きない。
     use std::process::Command;
-    Command::new("cmd")
-        .args(["/C", "start", "", url])
+    Command::new("rundll32.exe")
+        .args(["url.dll,FileProtocolHandler", url])
         .spawn()
         .map(|_| ())
 }
