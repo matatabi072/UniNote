@@ -113,12 +113,21 @@ cargo build --release -p uninote-sync-gtasks
 
 ## 🔌 関連ツール（プラグイン）
 
-外部 API 連携とは別に、**ローカル機能を拡張する独立 GUI/CLI ツール** を `tools/` フォルダに配置すると自動検出されます。本体の設定 →「関連ツール」セクションから起動可能。各ツールは UniNote なしでも単独動作するよう設計されています。
+外部 API 連携とは別に、**ローカル機能を拡張する独立 GUI/CLI ツール** を `tools/` フォルダ（または Program Files / Downloads など標準的な場所）に配置すると自動検出されます。本体の設定 →「関連ツール」セクションから起動可能。各ツールは別リポジトリで配布されている独立 OSS で、UniNote なしでも単独動作するよう設計されています。
 
-| ツール | 機能 |
-|--------|------|
-| **SimpleCalendar** | tasks.json と連携するカレンダー表示（月/週/日）。`--linked-tasks` で UniNote の tasks.json を read-merge-write 共同管理 |
-| **PCReminder** | scheduledDateTime に応じて PC スリープ/復帰/通知を Windows タスクスケジューラに予約。CLI ベースで本体クラッシュ耐性あり |
+| ツール | リポジトリ | 機能 |
+|--------|----------|------|
+| **SimpleCalendar** | [matatabi072/SimpleCalendar](https://github.com/matatabi072/SimpleCalendar) | tasks.json と連携するカレンダー表示（月/週/日）。`--linked-tasks` で UniNote の tasks.json を read-merge-write 共同管理 |
+| **PCReminder** | [matatabi072/PCReminder](https://github.com/matatabi072/PCReminder) | scheduledDateTime に応じて PC スリープ/復帰/通知を Windows タスクスケジューラに予約。CLI ベースで本体クラッシュ耐性あり |
+
+### 導入方法
+
+1. 各リポジトリの **Releases** から exe をダウンロード
+2. 以下のいずれかに配置（どこに置いても自動検出される）:
+   - UniNote と同じフォルダの `tools/` 配下
+   - `C:\Program Files\` / `C:\Program Files (x86)\` 配下（インストーラー使用時）
+   - `ダウンロード` フォルダ（一時的に動作確認したい時）
+3. 検出されない場合は設定 →「関連ツール」→「登録(検出されない時)」から exe を手動指定
 
 配置例:
 ```
